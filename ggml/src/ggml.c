@@ -35,6 +35,7 @@
 #include <signal.h>
 #if defined(__gnu_linux__)
 #include <syscall.h>
+#include <sys/mman.h>
 #endif
 
 #if defined(__APPLE__)
@@ -52,6 +53,46 @@
 #endif
 
 #define UNUSED GGML_UNUSED
+
+#if defined(_WIN32)
+static bool ggml_enable_large_pages(void) {
+    HANDLE token;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+        return false;
+    }
+
+    LUID luid;
+    if (!LookupPrivilegeValue(NULL, SE_LOCK_MEMORY_NAME, &luid)) {
+        CloseHandle(token);
+        return false;
+    }
+
+    TOKEN_PRIVILEGES tp;
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    if (!AdjustTokenPrivileges(token, FALSE, &tp, 0, NULL, 0)) {
+        CloseHandle(token);
+        return false;
+    }
+
+    CloseHandle(token);
+    return true;
+}
+
+static SIZE_T ggml_get_large_page_minimum(void) {
+    static SIZE_T large_page_size = 0;
+    if (large_page_size == 0) {
+        large_page_size = GetLargePageMinimum();
+        if (large_page_size == 0) {
+            DWORD error = GetLastError();
+            GGML_LOG_WARN("GetLargePageMinimum failed: %lu\n", error);
+        }
+    }
+    return large_page_size;
+}
+#endif
 
 // Needed for ggml_fp32_to_bf16_row()
 #if defined(__AVX512BF16__)
@@ -321,6 +362,21 @@ void * ggml_aligned_malloc(size_t size) {
 #endif
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
+    static bool large_pages_enabled = false;
+    static bool large_pages_tried = false;
+    if (!large_pages_tried) {
+        large_pages_enabled = ggml_enable_large_pages();
+        large_pages_tried = true;
+    }
+    SIZE_T large_page_size = ggml_get_large_page_minimum();
+    if (large_pages_enabled && large_page_size > 0 && size >= large_page_size) {
+        size_t size_aligned = (size + large_page_size - 1) & ~(large_page_size - 1);
+        void * ptr = VirtualAlloc(NULL, size_aligned, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
+        if (ptr) {
+            return ptr;
+        }
+        GGML_LOG_WARN("large page allocation failed, falling back to regular allocation\n");
+    }
     return _aligned_malloc(size, alignment);
 #else
     if (size == 0) {
@@ -364,6 +420,12 @@ void * ggml_aligned_malloc(size_t size) {
         }
         GGML_LOG_ERROR("%s: %s (attempted to allocate %6.2f MB)\n", __func__, error_desc, size/(1024.0*1024.0));
         return NULL;
+  #ifdef MADV_HUGEPAGE
+    } else {
+        if (size >= 1024*1024 && posix_madvise(aligned_memory, size, MADV_HUGEPAGE) != 0) {
+            GGML_LOG_WARN("failed to enable huge pages for buffer of size %zu: %s\n", size, strerror(errno));
+        }
+  #endif
     }
     return aligned_memory;
 #endif
@@ -372,7 +434,12 @@ void * ggml_aligned_malloc(size_t size) {
 void ggml_aligned_free(void * ptr, size_t size) {
     GGML_UNUSED(size);
 #if defined(_MSC_VER) || defined(__MINGW32__)
-    _aligned_free(ptr);
+    SIZE_T large_page_size = ggml_get_large_page_minimum();
+    if (ptr != NULL && large_page_size > 0 && ((uintptr_t)ptr & (large_page_size - 1)) == 0) {
+        VirtualFree(ptr, 0, MEM_RELEASE);
+    } else {
+        _aligned_free(ptr);
+    }
 #elif GGML_USE_CPU_HBM
     if (ptr != NULL) {
         hbw_free(ptr);
